@@ -1,0 +1,302 @@
+name: Upstream release
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: dispatcharr-upstream-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover stable upstream release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      mode: ${{ steps.release.outputs.mode }}
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.release.outputs.image }}
+      upstream_digest: ${{ steps.release.outputs.upstream_digest }}
+      build_tag: ${{ steps.release.outputs.build_tag }}
+      existing_digest: ${{ steps.release.outputs.existing_digest }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Resolve release and image state
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          releases=$(gh api --method GET repos/Dispatcharr/Dispatcharr/releases -f per_page=100)
+          tag=$(jq -er '[.[] | select(.draft == false and .prerelease == false)] | first | .tag_name' <<<"$releases")
+          version=${tag#v}
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream release tag: $tag" >&2
+            exit 1
+          fi
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          upstream="ghcr.io/dispatcharr/dispatcharr:$version"
+          upstream_manifest=$(docker buildx imagetools inspect "$upstream" --raw)
+          upstream_digest=$(jq -er '
+            [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")]
+            | if length == 1 then .[0].digest else error("expected exactly one linux/arm64 manifest") end
+          ' <<<"$upstream_manifest")
+          if [[ ! "$upstream_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid ARM64 digest for $upstream: $upstream_digest" >&2
+            exit 1
+          fi
+
+          build_tag="$image:ci-$version-${upstream_digest#sha256:}"
+          mode=build
+          existing_digest=
+
+          if stable_info=$(docker buildx imagetools inspect "$image:$version" 2>/dev/null); then
+            stable_labels=$(docker buildx imagetools inspect "$image:$version" \
+              --format '{{json .Image.Config.Labels}}')
+            stable_upstream_digest=$(jq -r '."org.opencontainers.image.base.digest" // empty' <<<"$stable_labels")
+            if [ "$stable_upstream_digest" = "$upstream_digest" ]; then
+              existing_digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$stable_info")
+              latest_digest=
+              if latest_info=$(docker buildx imagetools inspect "$image:latest" 2>/dev/null); then
+                latest_digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$latest_info")
+              fi
+              if [ "$latest_digest" = "$existing_digest" ]; then
+                mode=skip
+              else
+                mode=promote
+              fi
+            else
+              echo "Upstream reused $version with a new ARM64 digest; rebuilding."
+            fi
+          fi
+
+          if [ -n "$existing_digest" ] && [[ ! "$existing_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid custom image digest: $existing_digest" >&2
+            exit 1
+          fi
+
+          {
+            echo "mode=$mode"
+            echo "version=$version"
+            echo "image=$image"
+            echo "upstream_digest=$upstream_digest"
+            echo "build_tag=$build_tag"
+            echo "existing_digest=$existing_digest"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Dispatcharr $version: mode=$mode upstream_arm64=$upstream_digest"
+
+  build:
+    name: Build and test on hosted ARM64
+    needs: discover
+    if: needs.discover.outputs.mode == 'build'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build test image
+        env:
+          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+          UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
+          UPSTREAM_VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          docker buildx build --load --platform linux/arm64 \
+            --build-arg "UPSTREAM_IMAGE=ghcr.io/dispatcharr/dispatcharr@$UPSTREAM_DIGEST" \
+            --build-arg "UPSTREAM_VERSION=$UPSTREAM_VERSION" \
+            --build-arg "UPSTREAM_DIGEST=$UPSTREAM_DIGEST" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$BUILD_TAG" .
+
+      - name: Run hosted ARM64 tests
+        env:
+          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+        run: sh scripts/test-image.sh "$BUILD_TAG"
+
+  raspberry_pi:
+    name: Build, validate, and publish on Raspberry Pi 16 KiB
+    needs: [discover, build]
+    if: >-
+      ${{ always() && needs.discover.result == 'success' &&
+          needs.discover.outputs.mode == 'build' && needs.build.result == 'success' }}
+    runs-on: [self-hosted, linux, arm64, raspberry-pi-16k]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      published_digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build image on the Raspberry Pi
+        env:
+          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+          UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
+          UPSTREAM_VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          docker buildx build --load --platform linux/arm64 \
+            --build-arg "UPSTREAM_IMAGE=ghcr.io/dispatcharr/dispatcharr@$UPSTREAM_DIGEST" \
+            --build-arg "UPSTREAM_VERSION=$UPSTREAM_VERSION" \
+            --build-arg "UPSTREAM_DIGEST=$UPSTREAM_DIGEST" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$BUILD_TAG" .
+
+      - name: Run mandatory real-device tests
+        env:
+          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+          REQUIRE_PAGE_SIZE: "16384"
+        run: sh scripts/test-image.sh "$BUILD_TAG"
+
+      - name: Log in to GHCR after all tests pass
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish versioned image
+        id: publish
+        shell: bash
+        env:
+          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+          IMAGE: ${{ needs.discover.outputs.image }}
+          VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker tag "$BUILD_TAG" "$IMAGE:$VERSION"
+          docker push "$IMAGE:$VERSION"
+          info=$(docker buildx imagetools inspect "$IMAGE:$VERSION")
+          digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$info")
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid published digest: $digest" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+
+  promote:
+    name: Publish stable tags
+    needs: [discover, build, raspberry_pi]
+    if: >-
+      ${{ always() && needs.discover.result == 'success' &&
+          (needs.discover.outputs.mode == 'promote' ||
+           (needs.discover.outputs.mode == 'build' && needs.build.result == 'success' &&
+            needs.raspberry_pi.result == 'success')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Promote validated digest
+        shell: bash
+        env:
+          MODE: ${{ needs.discover.outputs.mode }}
+          IMAGE: ${{ needs.discover.outputs.image }}
+          VERSION: ${{ needs.discover.outputs.version }}
+          EXISTING_DIGEST: ${{ needs.discover.outputs.existing_digest }}
+          PUBLISHED_DIGEST: ${{ needs.raspberry_pi.outputs.published_digest }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            promote) digest=$EXISTING_DIGEST ;;
+            build) digest=$PUBLISHED_DIGEST ;;
+            *) echo "Unexpected promotion mode: $MODE" >&2; exit 1 ;;
+          esac
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid promotion digest: $digest" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$digest"
+
+          version_info=$(docker buildx imagetools inspect "$IMAGE:$VERSION")
+          latest_info=$(docker buildx imagetools inspect "$IMAGE:latest")
+          version_digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$version_info")
+          latest_digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$latest_info")
+          test "$version_digest" = "$digest"
+          test "$latest_digest" = "$digest"
+
+  report_failure:
+    name: Report release failure
+    needs: [discover, build, raspberry_pi, promote]
+    if: >-
+      ${{ always() &&
+          (needs.discover.result == 'failure' || needs.build.result == 'failure' ||
+           needs.raspberry_pi.result == 'failure' || needs.promote.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update failure issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.discover.outputs.version }}
+          MODE: ${{ needs.discover.outputs.mode }}
+          UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PI_RESULT: ${{ needs.raspberry_pi.result }}
+          PROMOTE_RESULT: ${{ needs.promote.result }}
+        run: |
+          set -euo pipefail
+          version=${VERSION:-discovery}
+          title="[upstream-release] Dispatcharr $version failed"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf '%s\n' \
+            "Automated processing failed; existing stable GHCR tags were not replaced before validation completed." \
+            "" \
+            "- Upstream version: \`$version\`" \
+            "- Upstream ARM64 digest: \`${UPSTREAM_DIGEST:-unresolved}\`" \
+            "- Workflow mode: \`${MODE:-unknown}\`" \
+            "- Discovery: \`$DISCOVER_RESULT\`" \
+            "- Hosted ARM64 build/tests: \`$BUILD_RESULT\`" \
+            "- Raspberry Pi 16 KiB validation: \`$PI_RESULT\`" \
+            "- Stable promotion: \`$PROMOTE_RESULT\`" \
+            "- Failed run: $run_url" \
+            "" \
+            "Re-run the workflow after correcting the failure. If the version tag was published, the next run only repairs latest.")
+
+          issues=$(gh api --method GET "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100")
+          number=$(jq -r --arg title "$title" \
+            '[.[] | select(has("pull_request") | not) | select(.title == $title)] | first | .number // empty' \
+            <<<"$issues")
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
