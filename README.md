@@ -64,9 +64,9 @@ It must return `PONG`.
 1. Selects the latest non-draft, non-prerelease `Dispatcharr/Dispatcharr` release.
 2. Resolves and pins the official `linux/arm64` image digest.
 3. Skips an unchanged upstream image that has already been published.
-4. Registers ARM64 QEMU user-mode emulation on a GitHub-hosted x86 Linux worker.
-5. Requires the ARM64 container to report a page size of exactly `16384` bytes.
-6. Runs Redis startup, `PING`, AIO initialization, PostgreSQL/Celery, HTTP initialization, and authentication API tests under that emulated page size.
+4. Builds and runs the complete AIO integration suite on GitHub's native ARM64 worker.
+5. Extracts the exact Redis server and CLI from that locally tested image.
+6. Runs those binaries explicitly through `qemu-aarch64 -p 16384`, then requires Redis startup and `PING` to return `PONG`.
 7. Pushes the versioned image only after every test passes, then updates `latest` to the same digest.
 8. Leaves existing stable tags untouched and opens or updates a GitHub issue if processing fails.
 
@@ -74,9 +74,9 @@ No self-hosted runner, Raspberry Pi software, test-image pull, or manual promoti
 
 ### What the 16 KiB test proves
 
-QEMU's `QEMU_PAGESIZE=16384` mode makes the ARM64 processes inside the actual AIO image observe a 16 KiB page size. The workflow asserts that value before testing Redis and the complete application. This directly exercises the condition that caused the bundled jemalloc Redis binary to fail.
+QEMU's explicit `-p 16384` option makes the extracted ARM64 Redis processes behave as if the host page size were 16 KiB. The test first verifies that page size, then starts the image's exact Redis binary and checks it with the image's Redis CLI. This directly exercises the condition that caused the bundled jemalloc Redis binary to fail.
 
-This is an emulated kernel-ABI compatibility test, not a physical Raspberry Pi hardware test. Raspberry Pi OS userspace is not used because containers use the Ubuntu userspace in the Dispatcharr image; the host contributes the kernel ABI, which is the part being emulated here.
+The complete Dispatcharr AIO and authentication flow runs separately on native ARM64. The 16 KiB Redis check is an emulated kernel-ABI test, not a physical Raspberry Pi hardware test. Raspberry Pi OS userspace is not used because containers use the Ubuntu userspace in the Dispatcharr image; only the relevant page-size behavior needs emulation.
 
 ## Repository and package settings
 
@@ -97,6 +97,8 @@ This is an emulated kernel-ABI compatibility test, not a physical Raspberry Pi h
 - Initial administrator creation, JWT issuance, and an authenticated request succeed.
 
 `scripts/test-compatibility.sh` provides a shorter post-deployment check for a container named `dispatcharr`.
+
+`scripts/test-redis-qemu.sh IMAGE` extracts Redis from an image and verifies startup and `PONG` through `qemu-aarch64 -p 16384`.
 
 ## Rollback
 
