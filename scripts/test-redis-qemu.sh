@@ -49,6 +49,7 @@ printf '%s\n' "$version" | grep -F "malloc=libc"
 
 socket="$work_dir/redis.sock"
 qemu-aarch64 -p 16384 "$work_dir/redis-server" \
+    --ignore-warnings ARM64-COW-BUG \
     --save "" \
     --appendonly no \
     --port 0 \
