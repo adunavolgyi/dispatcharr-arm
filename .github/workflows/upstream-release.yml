@@ -71,7 +71,9 @@ jobs:
             stable_labels=$(docker buildx imagetools inspect "$image:$version" \
               --format '{{json .Image.Config.Labels}}')
             stable_upstream_digest=$(jq -r '."org.opencontainers.image.base.digest" // empty' <<<"$stable_labels")
-            if [ "$stable_upstream_digest" = "$upstream_digest" ]; then
+            stable_validation=$(jq -r '."io.github.adunavolgyi.dispatcharr-arm.validation" // empty' <<<"$stable_labels")
+            if [ "$stable_upstream_digest" = "$upstream_digest" ] && \
+               [ "$stable_validation" = "qemu-user-arm64-16k" ]; then
               existing_digest=$(awk '$1 == "Digest:" {print $2; exit}' <<<"$stable_info")
               latest_digest=
               if latest_info=$(docker buildx imagetools inspect "$image:latest" 2>/dev/null); then
@@ -104,46 +106,11 @@ jobs:
           echo "Dispatcharr $version: mode=$mode upstream_arm64=$upstream_digest"
 
   build:
-    name: Build and test on hosted ARM64
+    name: Build and test emulated ARM64 with 16 KiB pages
     needs: discover
     if: needs.discover.outputs.mode == 'build'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-
-      - name: Build test image
-        env:
-          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
-          UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
-          UPSTREAM_VERSION: ${{ needs.discover.outputs.version }}
-        run: |
-          docker buildx build --load --platform linux/arm64 \
-            --build-arg "UPSTREAM_IMAGE=ghcr.io/dispatcharr/dispatcharr@$UPSTREAM_DIGEST" \
-            --build-arg "UPSTREAM_VERSION=$UPSTREAM_VERSION" \
-            --build-arg "UPSTREAM_DIGEST=$UPSTREAM_DIGEST" \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --tag "$BUILD_TAG" .
-
-      - name: Run hosted ARM64 tests
-        env:
-          BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
-        run: sh scripts/test-image.sh "$BUILD_TAG"
-
-  raspberry_pi:
-    name: Build, validate, and publish on Raspberry Pi 16 KiB
-    needs: [discover, build]
-    if: >-
-      ${{ always() && needs.discover.result == 'success' &&
-          needs.discover.outputs.mode == 'build' && needs.build.result == 'success' }}
-    runs-on: [self-hosted, linux, arm64, raspberry-pi-16k]
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -153,10 +120,26 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3-68
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
-      - name: Build image on the Raspberry Pi
+      - name: Verify emulated ARM64 page size
+        env:
+          UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
+        run: |
+          page_size=$(docker run --rm --platform linux/arm64 \
+            --env QEMU_PAGESIZE=16384 \
+            --entrypoint getconf \
+            "ghcr.io/dispatcharr/dispatcharr@$UPSTREAM_DIGEST" PAGESIZE)
+          test "$page_size" = 16384
+
+      - name: Build ARM64 image
         env:
           BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
           UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
@@ -167,11 +150,13 @@ jobs:
             --build-arg "UPSTREAM_VERSION=$UPSTREAM_VERSION" \
             --build-arg "UPSTREAM_DIGEST=$UPSTREAM_DIGEST" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "io.github.adunavolgyi.dispatcharr-arm.validation=qemu-user-arm64-16k" \
             --tag "$BUILD_TAG" .
 
-      - name: Run mandatory real-device tests
+      - name: Run full AIO tests with 16 KiB pages
         env:
           BUILD_TAG: ${{ needs.discover.outputs.build_tag }}
+          EMULATED_PAGE_SIZE: "16384"
           REQUIRE_PAGE_SIZE: "16384"
         run: sh scripts/test-image.sh "$BUILD_TAG"
 
@@ -201,12 +186,11 @@ jobs:
 
   promote:
     name: Publish stable tags
-    needs: [discover, build, raspberry_pi]
+    needs: [discover, build]
     if: >-
       ${{ always() && needs.discover.result == 'success' &&
           (needs.discover.outputs.mode == 'promote' ||
-           (needs.discover.outputs.mode == 'build' && needs.build.result == 'success' &&
-            needs.raspberry_pi.result == 'success')) }}
+           (needs.discover.outputs.mode == 'build' && needs.build.result == 'success')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -227,7 +211,7 @@ jobs:
           IMAGE: ${{ needs.discover.outputs.image }}
           VERSION: ${{ needs.discover.outputs.version }}
           EXISTING_DIGEST: ${{ needs.discover.outputs.existing_digest }}
-          PUBLISHED_DIGEST: ${{ needs.raspberry_pi.outputs.published_digest }}
+          PUBLISHED_DIGEST: ${{ needs.build.outputs.published_digest }}
         run: |
           set -euo pipefail
           case "$MODE" in
@@ -251,11 +235,11 @@ jobs:
 
   report_failure:
     name: Report release failure
-    needs: [discover, build, raspberry_pi, promote]
+    needs: [discover, build, promote]
     if: >-
       ${{ always() &&
           (needs.discover.result == 'failure' || needs.build.result == 'failure' ||
-           needs.raspberry_pi.result == 'failure' || needs.promote.result == 'failure') }}
+           needs.promote.result == 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -270,7 +254,6 @@ jobs:
           UPSTREAM_DIGEST: ${{ needs.discover.outputs.upstream_digest }}
           DISCOVER_RESULT: ${{ needs.discover.result }}
           BUILD_RESULT: ${{ needs.build.result }}
-          PI_RESULT: ${{ needs.raspberry_pi.result }}
           PROMOTE_RESULT: ${{ needs.promote.result }}
         run: |
           set -euo pipefail
@@ -284,8 +267,7 @@ jobs:
             "- Upstream ARM64 digest: \`${UPSTREAM_DIGEST:-unresolved}\`" \
             "- Workflow mode: \`${MODE:-unknown}\`" \
             "- Discovery: \`$DISCOVER_RESULT\`" \
-            "- Hosted ARM64 build/tests: \`$BUILD_RESULT\`" \
-            "- Raspberry Pi 16 KiB validation: \`$PI_RESULT\`" \
+            "- QEMU ARM64 16 KiB build/tests: \`$BUILD_RESULT\`" \
             "- Stable promotion: \`$PROMOTE_RESULT\`" \
             "- Failed run: $run_url" \
             "" \

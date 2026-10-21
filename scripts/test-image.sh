@@ -27,17 +27,38 @@ architecture=$(uname -m)
 page_size=$(getconf PAGESIZE)
 echo "Test host: architecture=$architecture page_size=$page_size"
 
-if [ "$architecture" != "aarch64" ]; then
-    echo "ERROR: the image tests require a native ARM64 host." >&2
+emulated_page_size=${EMULATED_PAGE_SIZE:-}
+if [ -n "$emulated_page_size" ] && [ "$emulated_page_size" != "16384" ]; then
+    echo "ERROR: only 16384-byte page emulation is supported." >&2
     exit 1
 fi
 
-if [ -n "${REQUIRE_PAGE_SIZE:-}" ] && [ "$page_size" != "$REQUIRE_PAGE_SIZE" ]; then
-    echo "ERROR: host page size is $page_size bytes, expected $REQUIRE_PAGE_SIZE." >&2
+if [ "$architecture" != "aarch64" ] && [ -z "$emulated_page_size" ]; then
+    echo "ERROR: the image tests require native ARM64 or EMULATED_PAGE_SIZE=16384." >&2
     exit 1
 fi
 
-docker run --detach \
+set -- docker run --rm --entrypoint sh
+if [ -n "$emulated_page_size" ]; then
+    set -- "$@" --platform linux/arm64 --env "QEMU_PAGESIZE=$emulated_page_size"
+fi
+set -- "$@" "$image" -c 'printf "%s %s\n" "$(uname -m)" "$(getconf PAGESIZE)"'
+container_platform=$("$@")
+container_architecture=${container_platform%% *}
+container_page_size=${container_platform#* }
+echo "Test container: architecture=$container_architecture page_size=$container_page_size"
+
+if [ "$container_architecture" != "aarch64" ]; then
+    echo "ERROR: container architecture is $container_architecture, expected aarch64." >&2
+    exit 1
+fi
+
+if [ -n "${REQUIRE_PAGE_SIZE:-}" ] && [ "$container_page_size" != "$REQUIRE_PAGE_SIZE" ]; then
+    echo "ERROR: container page size is $container_page_size bytes, expected $REQUIRE_PAGE_SIZE." >&2
+    exit 1
+fi
+
+set -- docker run --detach \
     --name "$container" \
     --tmpfs /data:rw,nosuid,nodev \
     --env DISPATCHARR_ENV=aio \
@@ -46,8 +67,12 @@ docker run --detach \
     --env DISPATCHARR_DEBUG=true \
     --env UWSGI_WORKERS=1 \
     --env CELERY_MAX_WORKERS=1 \
-    --env CELERY_MIN_WORKERS=1 \
-    "$image" >/dev/null
+    --env CELERY_MIN_WORKERS=1
+if [ -n "$emulated_page_size" ]; then
+    set -- "$@" --platform linux/arm64 --env "QEMU_PAGESIZE=$emulated_page_size"
+fi
+set -- "$@" "$image"
+"$@" >/dev/null
 started=true
 
 attempt=0
@@ -103,7 +128,11 @@ printf '%s' "$user_response" | grep -Eq '"username"[[:space:]]*:[[:space:]]*"cia
 
 echo "PASS: Redis startup, PING, AIO initialization, and authentication API checks succeeded."
 if [ "${REQUIRE_PAGE_SIZE:-}" = "16384" ]; then
-    echo "PASS: real-device ARM64 16 KiB page-size compatibility is confirmed."
+    if [ -n "$emulated_page_size" ]; then
+        echo "PASS: QEMU exposed a 16 KiB page size to the ARM64 container."
+    else
+        echo "PASS: native ARM64 16 KiB page-size compatibility is confirmed."
+    fi
 else
     echo "NOTICE: this is a normal ARM64 test, not proof of 16 KiB Raspberry Pi compatibility."
 fi
