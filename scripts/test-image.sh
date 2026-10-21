@@ -54,7 +54,6 @@ docker run --detach \
     --env DISPATCHARR_ENV=aio \
     --env REDIS_HOST=localhost \
     --env CELERY_BROKER_URL=redis://localhost:6379/0 \
-    --env DISPATCHARR_DEBUG=true \
     --env UWSGI_WORKERS=1 \
     --env CELERY_MAX_WORKERS=1 \
     --env CELERY_MIN_WORKERS=1 \
