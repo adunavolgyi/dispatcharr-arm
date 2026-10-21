@@ -2,7 +2,7 @@
 
 This repository builds a minimal derivative of the official Dispatcharr AIO image for ARM64 kernels that use 16 KiB memory pages, including relevant Raspberry Pi configurations.
 
-Only `/usr/bin/redis-server` is replaced. Redis 8.10.1 is compiled with `MALLOC=libc` so it does not depend on jemalloc's unsupported page-size assumptions. The official Dispatcharr entrypoint, application, PostgreSQL, Celery, nginx, Redis tools, environment variables, and `/data` storage remain unchanged.
+Only `/usr/bin/redis-server` and `/usr/bin/redis-cli` are replaced. Both come from the same Redis 8.10.1 `MALLOC=libc` build, so the server and the required `redis-cli ping` check do not depend on jemalloc's unsupported page-size assumptions. The official Dispatcharr entrypoint, application, PostgreSQL, Celery, nginx, remaining Redis package files, environment variables, and `/data` storage remain unchanged.
 
 Current build defaults:
 

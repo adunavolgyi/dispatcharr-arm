@@ -23,9 +23,11 @@ RUN test "$(dpkg --print-architecture)" = "arm64" \
     && tar -xzf /tmp/redis.tar.gz --strip-components=1 -C /tmp/redis \
     && make -C /tmp/redis -j"$(nproc)" MALLOC=libc build redis \
     && install -D -m 0755 /tmp/redis/src/redis-server /out/redis-server \
-    && strip /out/redis-server \
+    && install -D -m 0755 /tmp/redis/src/redis-cli /out/redis-cli \
+    && strip /out/redis-server /out/redis-cli \
     && /out/redis-server --version | grep -F "v=${REDIS_VERSION}" \
-    && /out/redis-server --version | grep -F "malloc=libc"
+    && /out/redis-server --version | grep -F "malloc=libc" \
+    && /out/redis-cli --version | grep -F "${REDIS_VERSION}"
 
 FROM ${UPSTREAM_IMAGE}
 
@@ -33,6 +35,7 @@ ARG UPSTREAM_VERSION
 ARG UPSTREAM_DIGEST
 
 COPY --from=redis-builder /out/redis-server /usr/bin/redis-server
+COPY --from=redis-builder /out/redis-cli /usr/bin/redis-cli
 
 LABEL org.opencontainers.image.title="Dispatcharr AIO for 16 KiB ARM64 kernels" \
       org.opencontainers.image.source="https://github.com/adunavolgyi/dispatcharr-arm" \
@@ -42,7 +45,9 @@ LABEL org.opencontainers.image.title="Dispatcharr AIO for 16 KiB ARM64 kernels" 
 
 RUN test "$(dpkg --print-architecture)" = "arm64" \
     && test "$(command -v redis-server)" = "/usr/bin/redis-server" \
+    && test "$(command -v redis-cli)" = "/usr/bin/redis-cli" \
     && test "$(readlink -f /usr/bin/redis-check-aof)" = "/usr/bin/redis-server" \
     && test "$(readlink -f /usr/bin/redis-check-rdb)" = "/usr/bin/redis-server" \
     && redis-server --version | grep -F "v=8.10.1" \
-    && redis-server --version | grep -F "malloc=libc"
+    && redis-server --version | grep -F "malloc=libc" \
+    && redis-cli --version | grep -F "8.10.1"
